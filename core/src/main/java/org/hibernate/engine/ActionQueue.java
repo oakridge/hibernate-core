@@ -23,35 +23,19 @@
  */
 package org.hibernate.engine;
 
+import org.hibernate.AssertionFailure;
+import org.hibernate.HibernateException;
+import org.hibernate.action.*;
+import org.hibernate.cache.CacheException;
+import org.hibernate.type.Type;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Set;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.hibernate.AssertionFailure;
-import org.hibernate.HibernateException;
-import org.hibernate.action.AfterTransactionCompletionProcess;
-import org.hibernate.action.BeforeTransactionCompletionProcess;
-import org.hibernate.action.BulkOperationCleanupAction;
-import org.hibernate.action.CollectionRecreateAction;
-import org.hibernate.action.CollectionRemoveAction;
-import org.hibernate.action.CollectionUpdateAction;
-import org.hibernate.action.EntityDeleteAction;
-import org.hibernate.action.EntityIdentityInsertAction;
-import org.hibernate.action.EntityInsertAction;
-import org.hibernate.action.EntityUpdateAction;
-import org.hibernate.action.Executable;
-import org.hibernate.cache.CacheException;
-import org.hibernate.type.Type;
+import java.util.*;
 
 /**
  * Responsible for maintaining the queue of actions related to events.
@@ -94,6 +78,9 @@ public class ActionQueue {
 	public ActionQueue(SessionImplementor session) {
 		this.session = session;
 		init();
+
+        //portico extension
+        useTrueCoalesce = Boolean.parseBoolean(session.getFactory().getProperties().getProperty("hibernate.extension.useTrueCoalesce"));
 	}
 
 	private void init() {
@@ -195,6 +182,9 @@ public class ActionQueue {
 	 * @throws HibernateException error preparing actions.
 	 */
 	public void prepareActions() throws HibernateException {
+        //portico extension
+        _CoalesceExtendedPersistenceQueue();
+
 		prepareActions( collectionRemovals );
 		prepareActions( collectionUpdates );
 		prepareActions( collectionCreations );
@@ -729,5 +719,205 @@ public class ActionQueue {
 		}
 
 	}
+
+
+
+    // begin portico customizations
+
+    //portico extension to track true coalesce
+    private final boolean useTrueCoalesce;
+
+    /**
+     * Added by Portico to allow "true coalesce" of new entities into a session. What this means is that instead
+     * of an INSERT/UPDATE pair being flushed, we will just have one INSERT with all the needfuls. The specific use case
+     * was this:
+     * <pre>
+     *      pojo = new MyPojo()
+     *      pojo.setFoo("foo value")
+     *
+     *      hibernateSession.persist(pojo)   // or merge
+     *
+     *      pojo.setBar("bar value")
+     *
+     *      hibernateSession.flush() // NO!!! This results in an INSERT *and* an UPDATE!!!! see http://www.delicious.com/sfraser/coalesce
+     * </pre>
+     *
+     * So in the previous pseudo code, the undesired behavior is that Hibernate queues up an INSERT that represents the
+     * state of the pojo at persist or merge time, and THEN an UPDATE syncing up the dirty starte of the managed
+     * pojo. In this case we would see bar = "bar value" in the UPDATE.
+     *
+     * This is very problematic for some applications. With the increased usage of "extended persistence context" such
+     * as in JBoss Seam and Spring Web Flow, this problem should become more of an issue. For example, what if your
+     * database has NOT NULL on "bar" above? The first INSERT would fail! Or what if you have DML triggers and having
+     * an INSERT/UPDATE pair is a problem? Not much you can do...
+     *
+     * This patch scans the ActionQueue and looks for queued up INSERT's on the passed in entity. If it finds a match,
+     * it simply overlays the INSERT values with the current dirty values, and returns true. The caller (in this case
+     * DefaultFlushEntityEventListener.scheduleUpdate) can then decide what to do. In this case the caller will
+     * decide not to queue up an UPDATE action.
+     *
+     * @param p_instance The entity that is being updated
+     * @param p_updateState The Update state
+     * @return Whether or not update state was merged into an already existing EntityInsertAction
+     * @see org.hibernate.action.EntityInsertAction#setState(Object[])
+     * @see org.hibernate.event.def.DefaultFlushEntityEventListener#scheduleUpdate(org.hibernate.event.FlushEntityEvent)
+     *
+     */
+    public boolean tryToCoalesceUpdateIntoInsert(final Object p_instance, final Object[] p_updateState) {
+
+        //if coalesce is disabled, don't do anything
+        //and inform the caller that nothing is to be done
+        if(!useTrueCoalesce){
+            return false;
+        }
+
+        final Iterator iterator = insertions.iterator();
+
+        while (iterator.hasNext()) {
+            EntityInsertAction insertAction = (EntityInsertAction)iterator.next();
+
+            // if we find an INSERT for the same entity that is the passed in UPDATE,
+            // we are going to monkey patch the insert:
+            if( insertAction.getInstance() == p_instance ) {
+                insertAction.setState(p_updateState);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * This method cleans up the actionQueue so that when
+     * the model is flushed to the database, spurious updates, inserts,
+     * and deletes are eliminated.  The following cases are currently handled:
+     *
+     *
+     * 1) When an insert and a delete is queued on the same object, but actions are removed from the queue
+     * 2) When an update and a delete are queued on the same object, the update is removed
+     *
+     */
+    private void _CoalesceExtendedPersistenceQueue() {
+
+        //if coalesce is disabled, don't do anything
+        if(!useTrueCoalesce){
+            return;
+        }
+
+        final Iterator deletionsIterator = deletions.iterator();
+		final List<EntityAction> insertActionsToCancel = new ArrayList<EntityAction>();
+		final List<EntityAction> updateActionsToCancel = new ArrayList<EntityAction>();
+		final List<EntityDeleteAction> deleteActionsToCancel = new ArrayList<EntityDeleteAction>();
+
+
+        //convert all insertions into a map where the key is object to be inserted
+        //and the value is the EntityAction
+        HashMap<Object, EntityAction> insertionsMap = new HashMap<Object, EntityAction>(insertions.size());
+        for(EntityInsertAction insertAction: (List<EntityInsertAction>)insertions){
+            insertionsMap.put(insertAction.getInstance(), insertAction);
+        }
+
+        //convert all updates into a map where the key is object to be inserted
+        //and the value is the EntityAction
+        HashMap<Object, EntityAction> updatesMap = new HashMap<Object, EntityAction>(insertions.size());
+        for(EntityUpdateAction updateAction: (List<EntityUpdateAction>)updates){
+            updatesMap.put(updateAction.getInstance(), updateAction);
+        }
+
+        /*
+        TODO: clean this up once we use generics; this means we need to understand the difference b/w EntityInsertAction and EntityInsertIdenityAction
+        most likely we ignore EntityInsertIdentityAction objects that are queeud as we actually want those to happen
+
+        TODO: Make sure that nothing is considered dirty after we "massage" the queue
+        */
+        boolean removeDelete = false;
+        //iterate all objects marked for deletion to determine if we need to coalesce any inserts and updates
+        for(final EntityDeleteAction deleteAction : (List<EntityDeleteAction>)deletions) {
+
+            //get the current instance marked for deletion from the queued action
+            //we'll use this to find the object to coalesce from the insertions and updates maps
+            final Object instanceMarkedForDeletion = deleteAction.getInstance();
+
+            //find any objects queued for insertion that are also
+            //marked for deletion.  If we find such an element, eliminate
+            //both actions from the queue
+            if( insertionsMap.containsKey(instanceMarkedForDeletion)) {
+                insertions.remove(insertionsMap.get(instanceMarkedForDeletion));
+                removeDelete = true;
+            }
+
+            //find any objects queued for update that are also
+            //marked for deletion.  If we find such an element, eliminate
+            //both actions from the queue
+            if( updatesMap.containsKey(instanceMarkedForDeletion)) {
+                updates.remove(updatesMap.get(instanceMarkedForDeletion));
+                removeDelete = true;
+            }
+
+            //if we determined that the delete should be removed, queue it up
+            // for removal later to avoid ConcurrentModificationExceptions.
+            if(removeDelete){
+                //reset the flag
+                removeDelete = false;
+                deleteActionsToCancel.add(deleteAction);
+            }
+        }
+		//iterate all the objects we're tracking for delete
+		//and remove them
+		for(EntityAction deleteAction:deleteActionsToCancel){
+			deletions.remove(deleteAction);
+		}
+    }
+
+    /**
+     * Retrieves all Entity instances queued for insertion
+     * @return An array of mapped objects queue for insertion
+     */
+    final public List getObjectsQueuedForInsertion(){
+        return retrieveQueuedObjectsFromList(insertions);
+    }
+
+    /**
+     * Retrieves all Entity instances queued for update
+     * @return An array of mapped objects queue for update
+     */
+    final public List getObjectsQueuedForUpdate(){
+        return retrieveQueuedObjectsFromList(updates);
+    }
+
+    /**
+     * Retrieves all Entity instances queued for deletion
+     * @return An array of mapped objects queue for deletion
+     */
+    final public List getObjectsQueuedForDeletion(){
+        return retrieveQueuedObjectsFromList(deletions);
+    }
+
+    /**
+     * Retrieves all instances in the supplied queue
+     * and returns them.  If not entities exist, an empty
+     * list will be returned.
+     * @param queueEntityActions
+     * @return
+     */
+    private List retrieveQueuedObjectsFromList(final List queueEntityActions){
+
+        //if there are no objects in the queue, return null
+        if(queueEntityActions.size()<1){
+            return java.util.Collections.emptyList();
+        }
+
+        final List objects = new ArrayList(queueEntityActions.size());
+        final ListIterator iterator = queueEntityActions.listIterator();
+
+        while(iterator.hasNext()){
+            EntityAction entityAction = (EntityAction)iterator.next();
+            objects.add(entityAction.getInstance());
+        }
+        return objects;
+
+    }
+
+    // end portico customizations
 
 }
